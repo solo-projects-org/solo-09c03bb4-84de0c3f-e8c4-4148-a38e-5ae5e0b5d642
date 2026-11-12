@@ -33,6 +33,7 @@ def oai_server(monkeypatch, tmp_path):
     monkeypatch.setattr(server_mod, "PAGE_SIZE", 10)
     monkeypatch.setattr(server_mod, "TOKEN_TTL", 3600)
     monkeypatch.setattr(server_mod, "TOKENS", server_mod.TokenStore())
+    server_mod.reset_records()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), server_mod.Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()

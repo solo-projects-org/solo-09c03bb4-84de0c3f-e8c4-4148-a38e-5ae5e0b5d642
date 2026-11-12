@@ -65,6 +65,31 @@ def _build_records() -> list[dict]:
 
 RECORDS = _build_records()
 
+# 初始状态：rec-013 为删除记录。管理端点可在联调时动态撤下/恢复某条书目，
+# 用于演示“两页之间补采撤下一条”时游标快照翻页不漂移。
+INITIAL_DELETED = {r["identifier"] for r in RECORDS if r["deleted"]}
+_RECORD_LOCK = threading.Lock()
+
+
+def set_record_deleted(identifier: str, deleted: bool) -> bool:
+    with _RECORD_LOCK:
+        for record in RECORDS:
+            if record["identifier"] == identifier:
+                record["deleted"] = deleted
+                return True
+    return False
+
+
+def reset_records() -> None:
+    with _RECORD_LOCK:
+        for record in RECORDS:
+            record["deleted"] = record["identifier"] in INITIAL_DELETED
+
+
+def withdrawn_ids() -> list[str]:
+    with _RECORD_LOCK:
+        return [r["identifier"] for r in RECORDS if r["deleted"]]
+
 
 class TokenStore:
     """resumptionToken 的内存存储，带 TTL 与故障注入开关。"""
@@ -119,6 +144,7 @@ class TokenStore:
                 "record_count": len(RECORDS),
                 "active_tokens": len(self._tokens),
                 "fail_next_token": self.fail_next_token,
+                "withdrawn_ids": withdrawn_ids(),
             }
 
 
@@ -365,11 +391,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _query(self) -> dict:
         parsed = urlparse(self.path)
+        params = parse_qs(parsed.query, keep_blank_values=True)
         if self.command == "POST":
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length).decode("UTF-8") if length else ""
-            return parse_qs(raw, keep_blank_values=True), parsed.path
-        return parse_qs(parsed.query, keep_blank_values=True), parsed.path
+            body_params = parse_qs(raw, keep_blank_values=True)
+            params.update(body_params)
+        return params, parsed.path
 
     def do_GET(self) -> None:  # noqa: N802
         self._dispatch()
@@ -400,7 +428,57 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/admin/reset":
             TOKENS.reset()
-            self._send_json({"ok": True, "message": "令牌库与故障开关已重置"})
+            reset_records()
+            self._send_json(
+                {
+                    "ok": True,
+                    "message": "令牌库、故障开关与样例记录状态已重置",
+                }
+            )
+            return
+        if path.startswith("/admin/withdraw") or path.startswith(
+            "/admin/restore"
+        ) or path.startswith("/admin/toggle"):
+            identifier = (
+                qs.get("identifier", [None])[0]
+                or qs.get("id", [None])[0]
+            )
+            if not identifier and path.count("/") >= 3:
+                identifier = path.rstrip("/").rsplit("/", 1)[-1]
+            if not identifier:
+                self._send_json(
+                    {"ok": False, "error": "缺少 identifier 参数"}, 400
+                )
+                return
+            current = next(
+                (r["deleted"] for r in RECORDS
+                 if r["identifier"] == identifier), None
+            )
+            if current is None:
+                self._send_json(
+                    {"ok": False, "error": f"记录不存在：{identifier}"}, 404
+                )
+                return
+            if path.startswith("/admin/withdraw"):
+                deleted = True
+            elif path.startswith("/admin/restore"):
+                deleted = False
+            else:
+                deleted = not current
+            set_record_deleted(identifier, deleted)
+            self._send_json(
+                {
+                    "ok": True,
+                    "identifier": identifier,
+                    "status": "deleted" if deleted else "active",
+                }
+            )
+            return
+        if path == "/admin/reset-records":
+            reset_records()
+            self._send_json(
+                {"ok": True, "message": "样例记录状态已恢复为初始值"}
+            )
             return
         if path != "/oai":
             self._send_xml(_error_response({}, "badVerb", f"未知路径：{path}"), 404)

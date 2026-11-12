@@ -15,6 +15,12 @@
 | 遇删除标记就撤下 | header `status=deleted` 的记录置为 `withdrawn`（库中不存在则写墓碑） |
 | 整批采完才提交书目变更和截止日 | 单事务 `BEGIN IMMEDIATE`，全部页取完才写库并提交；异常整体回滚 |
 | 无匹配也推进截止日 | `noRecordsMatch` 不写书目，同事务推进 `last_until` |
+| 目录翻页不受两次请求之间补采影响 | 取首页时把已提交目录流式复制到临时快照，响应头返回游标；续页只读快照 |
+| 保留原有 offset 调用和响应 | 无 `cursor` 时仍按 `status`/`limit`/`offset` 返回原来的 JSON 数组 |
+| 整轮沿用首页的筛选和页大小 | 游标内记录首页选定的 `status`/`limit`，续页请求里的同名字段不再生效 |
+| 同一游标重试返回同一页 | 快照只读且游标固定了页偏移，重复请求结果一致 |
+| 游标自首页起 5 分钟有效 | 游标携带固定的过期时间；过期返回 `410`，提示从首页重来并删除该轮快照 |
+| 不整份目录入内存、不跨请求持有主库读事务 | 快照按批 `fetchmany` 复制；主库读事务只在首页请求内存在 |
 | Docker Compose 启动服务和本地分页样例源 | `docker compose up --build` 启动 `harvester-api` + `oai-source` |
 | Swagger 发起采集并查询目录和进度 | http://localhost:8000/docs |
 
@@ -23,6 +29,7 @@
 ```
 app/                  FastAPI 采集服务
   main.py             路由（采集/目录/进度/运行历史/健康检查）
+  catalog.py          目录首页快照、游标编解码、过期回收
   harvester.py        采集编排：翻页、令牌失效重抓、整批事务
   oai_client.py       OAI-PMH 2.0 客户端（httpx + xml.etree）
   db.py               SQLite 表结构与事务操作
@@ -31,7 +38,7 @@ app/                  FastAPI 采集服务
 sample-oai/           本地分页样例 OAI-PMH 源（纯标准库）
   server.py           27 条样例记录（rec-013 为删除记录），PAGE_SIZE=10，3 页
   Dockerfile
-tests/                pytest 端到端测试（12 个用例）
+tests/                pytest 端到端测试（含目录快照翻页用例）
 scripts/              辅助脚本（故障回滚演示）
 docker-compose.yml
 ```
@@ -88,7 +95,52 @@ curl 'http://localhost:8000/api/v1/progress'                # 上次成功截止
 curl 'http://localhost:8000/api/v1/runs'                    # 采集运行历史
 ```
 
-### 4. 无匹配也推进截止日
+### 4. 固定目录并游标翻页（两页之间补采撤下也不会漏页）
+
+不带 `cursor` 的第一次请求就是原来的 `offset` 调用，响应体仍然是书目数组；
+首页响应头会多出 `X-Next-Cursor` 与 `X-Catalog-Cursor-Expires-At`：
+
+```bash
+# 首页：固定本轮目录（status=active, limit=10），并拿到游标
+curl -D - 'http://localhost:8000/api/v1/catalog?status=active&limit=10&offset=0'
+
+# 续页：只带 cursor；整轮沿用首页的 status/limit
+curl -H 'X-Next-Cursor: <上一步响应头里的游标>' \
+  'http://localhost:8000/api/v1/catalog?cursor=<游标>'
+
+# 同一游标重试仍返回同一页；末页不再返回 X-Next-Cursor
+```
+
+本轮快照自首页创建起 **5 分钟**有效。过期或快照已回收时接口返回 `410`，
+提示从首页重新获取，并删除该轮临时快照。游标续页期间补采照常提交；新首页
+会反映最新状态，但不会影响已经开始的那一轮。
+
+#### 对照演示：翻页途中撤下一条
+
+```bash
+# 1) 先完成一次全区间采集，目录有 26 条在架记录
+curl -X POST http://localhost:8000/api/v1/harvest \
+  -H 'Content-Type: application/json' \
+  -d '{"from": "2026-10-01", "until": "2026-10-27"}'
+
+# 2) 在 Swagger 取首页，记下响应头 X-Next-Cursor（limit=10 -> 共 3 页）
+
+# 3) 让样例源把首页中的 rec-005 标记为删除，再补采该日期将其撤下
+curl -X POST 'http://localhost:8080/admin/withdraw?identifier=oai:sample.lib:rec-005'
+curl -X POST http://localhost:8000/api/v1/harvest \
+  -H 'Content-Type: application/json' \
+  -d '{"from": "2026-10-05", "until": "2026-10-05"}'
+
+# 4) 用第 2 步的游标续页：仍是首页时刻的第二页，没有漏掉 rec-011
+# 5) 重新取首页：rec-005 已不在架，rec-011 补进首屏
+curl -X POST http://localhost:8080/admin/reset   # 恢复样例记录与令牌状态
+```
+
+可选管理端点：`/admin/withdraw?identifier=...`、`/admin/restore?identifier=...`、
+`/admin/toggle?identifier=...`、`/admin/reset-records`，以及原有的
+`/admin/fail-next`、`/admin/reset`。
+
+### 5. 无匹配也推进截止日
 
 对没有任何记录的区间发起采集，返回 `fetched=0` 且 `last_until` 照常推进。
 
@@ -117,7 +169,12 @@ curl -X POST http://localhost:8080/admin/reset   # 清除故障开关
 - 采集过程先在内存中收集全部页面，**不向 SQLite 写任何数据**；
 - 全部页成功后，在单个 `BEGIN IMMEDIATE` 事务内完成 upsert、撤下、截止日推进、运行历史更新；
 - 事务中任何一步失败都会 rollback，库状态回到采集前；
-- 进程内互斥锁保证同一时刻只有一个采集任务，并发请求返回 `409`。
+- 进程内互斥锁保证同一时刻只有一个采集任务，并发请求返回 `409`；
+- 目录首页在**本请求内**用一个主库读事务把已提交目录按批复制到临时快照库，
+  请求结束即释放连接；后续续页只读快照，不跨请求持有主库读事务。WAL 模式下
+  该读事务不会阻塞补采的写事务，补采可照常提交；
+- 快照按 500 行一批流式复制，不会一次把整份目录读入内存；默认部署为单进程
+  （`uvicorn app.main:app`，单 worker），游标签名与快照回收都在进程内完成。
 
 ## 本地开发（无 Docker）
 
@@ -143,5 +200,7 @@ pytest
 | --- | --- | --- |
 | `OAI_ENDPOINT` | `http://oai-source:8080/oai` | OAI-PMH 端点 |
 | `APP_DB_PATH` | `/data/harvester.db` | SQLite 数据库路径 |
+| `APP_SNAPSHOT_DIR` | 主库同目录下的 `catalog_snapshots/` | 目录快照临时目录 |
+| `CATALOG_CURSOR_TTL_SECONDS` | `300` | 目录游标自首页起的有效期秒数 |
 | `PAGE_SIZE`（样例源） | `10` | 样例源每页记录数 |
 | `TOKEN_TTL`（样例源） | `3600` | 样例源 resumptionToken 有效期秒数 |

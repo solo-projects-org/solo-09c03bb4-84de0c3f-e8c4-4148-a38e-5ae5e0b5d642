@@ -28,6 +28,8 @@ services:
     environment:
       OAI_ENDPOINT: "http://oai-source:8080/oai"
       APP_DB_PATH: "/data/harvester.db"
+      APP_SNAPSHOT_DIR: "/data/catalog_snapshots"
+      CATALOG_CURSOR_TTL_SECONDS: "300"
     ports:
       - "8000:8000"
     volumes:
